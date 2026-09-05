@@ -18,12 +18,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
-from mamba_ssm.modules.mamba3 import Mamba3
 
 try:
-    from mamba_ssm.ops.triton.layer_norm import RMSNorm
+    from mamba3_engine import Mamba3, RMSNorm
 except ImportError:
-    RMSNorm = nn.LayerNorm
+    from mamba_ssm.modules.mamba3 import Mamba3
+    try:
+        from mamba_ssm.ops.triton.layer_norm import RMSNorm
+    except ImportError:
+        RMSNorm = nn.LayerNorm
 
 
 def _find_model_root(base_dir: str) -> str:

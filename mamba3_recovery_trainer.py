@@ -1,83 +1,62 @@
 """mamba3_recovery_trainer.py — Two-Phase Mamba-3 Recovery Trainer
 ==================================================================
-Restores the converted Mamba-3 2.8B model to full capability after
-the Mamba-1 → Mamba-3 weight transplant.
+Restores capability after Mamba -> Mamba-3 conversion:
 
-Phase A (500 steps, default): freeze transplanted weights, train only new
-  Mamba-3 gate parameters (B/C biases, norms, and the in_proj gate rows
-  beyond split_idx=10240) at LR=1e-4.
+Phase A (default 500 steps):
+  Freeze transplanted weights, train only new Mamba-3 gate parameters
+  (B/C biases, norms, and dt_bias) at LR=1e-4.
 
-Phase B (1000 steps, default): unfreeze everything, full recovery at
-  LR=1e-5 (backbone) / 3e-5 (LM head) with the standard mixed dataset.
-
-Dataset format (Phase 14/7 native):
-  [LOGIC] {question}\\nSolution: <answer>{answer}</answer>
-  CE loss on answer tokens only (prompt masked with -100).
+Phase B (default 1000 steps):
+  Inject non-destructive forward-hook LoRA adapters onto out_proj and lm_head,
+  training adapters + gate parameters at LR=1e-5 to stay within 12GB VRAM
+  without triggering C++/CUDA kernel AttributeError.
 
 Usage:
-    python mamba3_recovery_trainer.py                    # full run
-    python mamba3_recovery_trainer.py --phase_a_steps 3 --total_steps 6  # smoke test
-    python mamba3_recovery_trainer.py --resume checkpoints/mamba3_recovery/mamba3_recovery_step200.pt
+    python mamba3_recovery_trainer.py --model_dir ./converted_model
+    python mamba3_recovery_trainer.py --smoke_test
+    python mamba3_recovery_trainer.py --resume checkpoints/mamba3_recovery/mamba3_recovery_best.pt
 """
 
 import os
 import time
+import json
+import math
 import random
 import argparse
-from collections import namedtuple
+import contextlib
+from typing import Optional, Tuple
 
-# Fix: expandable segments to reduce fragmentation under 12GB
+# Expandable segments to reduce memory fragmentation
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint as ckpt_utils
 from safetensors.torch import load_file
-
-from mamba_ssm.modules.mamba3 import Mamba3
-
-try:
-    from mamba_ssm.ops.triton.layer_norm import RMSNorm
-except ImportError:
-    RMSNorm = nn.LayerNorm
-
 from transformers import AutoTokenizer
 
-# ─── Paths ────────────────────────────────────────────────────────────────────
-MODEL_DIR = "/home/phil/.gemini/antigravity/scratch/mamba3-2.8b-latent"
-CKPT_DIR  = "checkpoints/mamba3_recovery"
-LOG_PATH  = "mamba3_recovery.log"
+from mamba3_engine import Mamba3LMModel, RMSNorm, CausalOutput
 
-# ─── Architecture (from conversion) ──────────────────────────────────────────
-D_MODEL   = 2560
-N_LAYER   = 64
-VOCAB_SIZE = 50280
-D_INNER   = D_MODEL * 2          # 5120
-HEADDIM   = 64
-D_STATE   = 64
-SPLIT_IDX = D_INNER * 2          # 10240 — boundary in in_proj between
-                                  # transplanted [z, x] and new Mamba-3 gates
-
-# ─── Training hyper-parameters ────────────────────────────────────────────────
+# ─── Training defaults ────────────────────────────────────────────────────────
 PHASE_A_STEPS = 500
 TOTAL_STEPS   = 1500
 BATCH         = 4
 
 LR_GATES = 1e-4     # Phase A: new gate params only
-LR_CORE  = 1e-5     # Phase B: full backbone  (recovery LR per user rules)
-LR_HEAD  = 3e-5     # Phase B: LM head
+LR_CORE  = 1e-5     # Phase B: LoRA adapters + gates
+LR_HEAD  = 3e-5     # Phase B: LM head adapter
 
 LOG_EVERY  = 50
 CKPT_EVERY = 200
-STOP_ACC   = 0.30    # Roll(100) early-stop threshold
+STOP_ACC   = 0.30
 STOP_AFTER = 800
+
+LORA_RANK  = 8
+LORA_ALPHA = 16.0
 
 GENERAL_RATIO = 0.50
 ANSWER_OPEN   = "<answer>"
 ANSWER_CLOSE  = "</answer>"
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ─── Dataset ─────────────────────────────────────────────────────────────────
 _MC = [
@@ -127,15 +106,7 @@ _QA = [
 ]
 
 
-def _make_chain(rng: random.Random) -> tuple:
-    """Generate a variable-hop chain problem and its answer.
-
-    Args:
-        rng: Seeded random instance.
-
-    Returns:
-        Tuple of (question_text, answer_string).
-    """
+def _make_chain(rng: random.Random) -> Tuple[str, str]:
     hops = rng.randint(2, 5)
     val  = str(rng.randint(1, 9999))
     parts = [f"V1={val}."]
@@ -145,15 +116,7 @@ def _make_chain(rng: random.Random) -> tuple:
     return " ".join(parts), val
 
 
-def make_sample(idx: int) -> tuple:
-    """Generate a (prompt, answer) pair in Phase 14 native format.
-
-    Args:
-        idx: Sample index for deterministic seeding.
-
-    Returns:
-        Tuple of (prompt_prefix, answer_string).
-    """
+def make_sample(idx: int) -> Tuple[str, str]:
     rng = random.Random(idx * 31337 + 7)
     if rng.random() < GENERAL_RATIO:
         fmt = rng.randint(0, 3)
@@ -174,215 +137,74 @@ def make_sample(idx: int) -> tuple:
         return f"[LOGIC] {q}\nSolution: ", a
 
 
-def build_ids(tokenizer: object, prompt: str, answer: str) -> tuple:
-    """Build input_ids and labels tensors for CE training.
-
-    Args:
-        tokenizer: HuggingFace tokenizer.
-        prompt: Prompt text (masked in labels with -100).
-        answer: Correct answer string (supervised in labels).
-
-    Returns:
-        Tuple of (input_ids [1, T], labels [1, T]).
-    """
+def build_ids(tokenizer: object, prompt: str, answer: str, device: str) -> Tuple[torch.Tensor, torch.Tensor]:
     answer_text = f"{ANSWER_OPEN}{answer}{ANSWER_CLOSE}"
-    p_ids  = tokenizer.encode(prompt,      add_special_tokens=False)
-    a_ids  = tokenizer.encode(answer_text, add_special_tokens=False)
-    full   = p_ids + a_ids
-    input_ids = torch.tensor([full], dtype=torch.long, device=DEVICE)
-    labels    = input_ids.clone()
+    p_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    a_ids = tokenizer.encode(answer_text, add_special_tokens=False)
+    full = p_ids + a_ids
+    input_ids = torch.tensor([full], dtype=torch.long, device=device)
+    labels = input_ids.clone()
     labels[0, :len(p_ids)] = -100
     return input_ids, labels
 
 
-# ─── Custom Mamba-3 LM model (correct tensor shapes) ─────────────────────────
+# ─── Model Loading ────────────────────────────────────────────────────────────
 
-CausalOutput = namedtuple("CausalOutput", ["logits"])
+def load_mamba3_model(
+    model_dir: str,
+    device: str,
+    dtype: torch.dtype = torch.bfloat16,
+    smoke_test: bool = False,
+) -> Tuple[Mamba3LMModel, dict]:
+    """Load Mamba-3 model dynamically from model_dir config and weights."""
+    cfg_path = os.path.join(model_dir, "config.json")
+    config = {}
+    if os.path.exists(cfg_path):
+        with open(cfg_path, "r") as f:
+            config = json.load(f)
 
+    d_model = config.get("hidden_size", config.get("d_model", 1024 if smoke_test else 2560))
+    n_layer = config.get("num_hidden_layers", config.get("n_layer", 2 if smoke_test else 48))
+    vocab_size = config.get("vocab_size", 50288)
+    headdim = config.get("head_dim", 64)
+    d_state = config.get("state_size", config.get("d_state", 128 if smoke_test else 64))
 
-class Mamba3Block(nn.Module):
-    """Pre-norm Mamba-3 residual block."""
-
-    def __init__(self, d_model: int, d_state: int, headdim: int,
-                 layer_idx: int, dtype: torch.dtype, device: str) -> None:
-        """Initialize one Mamba-3 block.
-
-        Args:
-            d_model: Hidden size.
-            d_state: SSM state dim.
-            headdim: Head dimension.
-            layer_idx: Layer index.
-            dtype: Param dtype.
-            device: Device.
-        """
-        super().__init__()
-        fkw = {"device": device, "dtype": dtype}
-        self.norm  = RMSNorm(d_model, eps=1e-5, **fkw)
-        self.mixer = Mamba3(d_model=d_model, d_state=d_state, headdim=headdim,
-                            is_mimo=False, chunk_size=64, layer_idx=layer_idx,
-                            **fkw)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward: pre-norm → mixer → residual.
-
-        Args:
-            x: [B, T, d_model].
-
-        Returns:
-            [B, T, d_model].
-        """
-        return x + self.mixer(self.norm(x))
-
-
-class Mamba3Backbone(nn.Module):
-    """Backbone: embedding + N Mamba3Block + final norm."""
-
-    def __init__(self, d_model: int, n_layer: int, vocab_size: int,
-                 d_state: int, headdim: int,
-                 dtype: torch.dtype, device: str) -> None:
-        """Initialize backbone.
-
-        Args:
-            d_model: Hidden dimension.
-            n_layer: Number of layers.
-            vocab_size: Vocabulary size.
-            d_state: SSM state size.
-            headdim: SSM head dimension.
-            dtype: Param dtype.
-            device: Device.
-        """
-        super().__init__()
-        fkw = {"device": device, "dtype": dtype}
-        self.embedding = nn.Embedding(vocab_size, d_model, **fkw)
-        self.layers    = nn.ModuleList([
-            Mamba3Block(d_model, d_state, headdim, i, dtype, device)
-            for i in range(n_layer)
-        ])
-        self.norm_f = RMSNorm(d_model, eps=1e-5, **fkw)
-
-    def forward(self, input_ids: torch.Tensor,
-                use_checkpoint: bool = False) -> torch.Tensor:
-        """Forward pass through backbone.
-
-        Args:
-            input_ids: [B, T].
-            use_checkpoint: If True, use activation checkpointing per layer
-                to trade compute for memory (critical for 12GB VRAM).
-
-        Returns:
-            [B, T, d_model].
-        """
-        x = self.embedding(input_ids)
-        for layer in self.layers:
-            if use_checkpoint and x.requires_grad:
-                x = ckpt_utils.checkpoint(layer, x, use_reentrant=False)
-            else:
-                x = layer(x)
-        return self.norm_f(x.to(self.norm_f.weight.dtype))
-
-
-class Mamba3LMModel(nn.Module):
-    """Mamba-3 causal LM: backbone + tied LM head."""
-
-    def __init__(self, d_model: int, n_layer: int, vocab_size: int,
-                 d_state: int = 64, headdim: int = 64,
-                 dtype: torch.dtype = torch.bfloat16,
-                 device: str = "cpu") -> None:
-        """Initialize Mamba3LMModel.
-
-        Args:
-            d_model: Hidden dimension.
-            n_layer: Number of layers.
-            vocab_size: Vocabulary size.
-            d_state: SSM state size.
-            headdim: SSM head dimension.
-            dtype: Param dtype.
-            device: Device.
-        """
-        super().__init__()
-        fkw = {"device": device, "dtype": dtype}
-        self.backbone = Mamba3Backbone(d_model, n_layer, vocab_size,
-                                       d_state, headdim, dtype, device)
-        self.lm_head  = nn.Linear(d_model, vocab_size, bias=False, **fkw)
-
-    def forward(self, input_ids: torch.Tensor,
-                use_checkpoint: bool = False) -> CausalOutput:
-        """Forward pass.
-
-        Args:
-            input_ids: [B, T].
-            use_checkpoint: Pass-through to backbone for grad checkpointing.
-
-        Returns:
-            CausalOutput with logits [B, T, vocab_size].
-        """
-        h = self.backbone(input_ids, use_checkpoint=use_checkpoint)
-        return CausalOutput(logits=self.lm_head(h.to(torch.bfloat16)))
-
-
-def _remap_key(k: str) -> str:
-    """Map safetensors keys (from converter) to Mamba3LMModel keys.
-
-    Converter stored:  backbone.layers.{i}.norm.weight
-                       backbone.layers.{i}.mixer.*
-    Mamba3LMModel has: backbone.layers.{i}.norm.weight  ✓
-                       backbone.layers.{i}.mixer.*       ✓
-
-    Args:
-        k: Original key from safetensors.
-
-    Returns:
-        Remapped key string.
-    """
-    return k   # layouts match — no remapping needed
-
-
-def load_mamba3_model() -> Mamba3LMModel:
-    """Build Mamba3LMModel shell and inject converted safetensors weights.
-
-    Returns:
-        Mamba3LMModel with transplanted Mamba-3 weights.
-    """
-    print("[INIT] Building Mamba-3 model shell on CPU (moving to GPU after load)…")
+    print(f"[INIT] Instantiating Mamba3LMModel (d_model={d_model}, n_layer={n_layer}, vocab_size={vocab_size})...")
     model = Mamba3LMModel(
-        d_model=D_MODEL, n_layer=N_LAYER, vocab_size=VOCAB_SIZE,
-        d_state=D_STATE, headdim=HEADDIM,
-        dtype=torch.bfloat16, device="cpu",
+        d_model=d_model,
+        n_layer=n_layer,
+        vocab_size=vocab_size,
+        d_state=d_state,
+        headdim=headdim,
+        dtype=dtype,
+        device=device,
     )
-    print("[INIT] Loading converted Mamba-3 safetensors…")
-    sd = load_file(os.path.join(MODEL_DIR, "model.safetensors"), device="cpu")
-    # Remap keys if needed
-    remapped = {_remap_key(k): v for k, v in sd.items()}
-    missing, unexpected = model.load_state_dict(remapped, strict=False)
-    if missing:
-        print(f"  [WARN] {len(missing)} missing keys (shell init kept): "
-              f"{missing[:3]}{'...' if len(missing) > 3 else ''}")
-    if unexpected:
-        print(f"  [INFO] {len(unexpected)} unexpected keys (ignored): "
-              f"{unexpected[:3]}{'...' if len(unexpected) > 3 else ''}")
-    model = model.to(DEVICE)
-    return model
+
+    sf_path = os.path.join(model_dir, "model.safetensors")
+    if os.path.exists(sf_path):
+        print(f"[INIT] Loading weights from {sf_path}...")
+        sd = load_file(sf_path, device=device)
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        if missing:
+            print(f"  [WARN] {len(missing)} missing keys in checkpoint.")
+        if unexpected:
+            print(f"  [INFO] {len(unexpected)} unexpected keys ignored.")
+    else:
+        if not smoke_test:
+            raise FileNotFoundError(f"Checkpoint not found at {sf_path}. Please check --model_dir.")
+        print("  [SMOKE_TEST] Initialized random shell weights for verification.")
+
+    model = model.to(device)
+    return model, config
 
 
-# ─── Freezing / unfreezing ────────────────────────────────────────────────────
+# ─── Freezing and Forward-Hook LoRA ───────────────────────────────────────────
 
 def freeze_transplanted(model: Mamba3LMModel) -> None:
-    """Freeze ALL weights for Phase A except the tiny new gate tensors.
-
-    The Mamba3 Triton backward builds the full 64-layer activation graph
-    if ANY in_proj/out_proj/D tensors are trainable. To avoid OOM, we set
-    requires_grad=False on everything and then selectively re-enable only
-    the small gate params (B_bias, C_bias, B_norm, C_norm, dt_bias).
-    This completely prevents the large SSM backward from being built.
-
-    Args:
-        model: The Mamba3LMModel.
-    """
-    # First freeze everything
+    """Freeze all base parameters except new Mamba-3 gates for Phase A."""
     for p in model.parameters():
         p.requires_grad = False
 
-    # Selectively unfreeze only the tiny new gate params
     for block in model.backbone.layers:
         mx = block.mixer
         for attr in ("B_bias", "C_bias", "dt_bias"):
@@ -394,145 +216,64 @@ def freeze_transplanted(model: Mamba3LMModel) -> None:
                     p.requires_grad = True
 
 
-def unfreeze_all(model: Mamba3LMModel) -> None:
-    """Unfreeze all parameters and clear in_proj backward hooks for Phase B.
+def _make_lora_hook(lora_A: nn.Parameter, lora_B: nn.Parameter, scale: float):
+    """Non-destructive LoRA forward hook leaving base nn.Linear untouched."""
+    def _hook(module, inputs, output):
+        # inputs[0]: [batch, seq_len, in_features]
+        delta = F.linear(inputs[0], lora_A) @ lora_B.t() * scale
+        return output + delta
+    return _hook
 
-    Args:
-        model: The Mamba3LMModel.
+
+def inject_lora(model: Mamba3LMModel, rank: int = LORA_RANK, alpha: float = LORA_ALPHA) -> None:
+    """Register forward-hook LoRA on out_proj and lm_head for Phase B.
+    
+    Prevents C++/CUDA AttributeError: 'LoRALinear' object has no attribute 'weight'.
     """
     for p in model.parameters():
-        p.requires_grad = True
-    for block in model.backbone.layers:
-        hooks = block.mixer.in_proj.weight._backward_hooks
-        if hooks is not None:
-            hooks.clear()
+        p.requires_grad = False
 
+    scale = alpha / rank
+    dtype = model.lm_head.weight.dtype
+    device = model.lm_head.weight.device
 
-# ─── Optimizers ───────────────────────────────────────────────────────────────
-
-def build_phase_a_optimizer(model: Mamba3LMModel) -> torch.optim.AdamW:
-    """Build Phase A optimizer — ONLY tiny new Mamba-3 gate tensors.
-
-    Deliberately excludes in_proj.weight (27M per layer × 64 = 1.7B) which
-    would OOM on 12GB. The backward hook on in_proj already zeroes the
-    transplanted rows, so the gate rows will be updated once we unfreeze
-    in Phase B. Phase A focuses solely on B/C biases and norms.
-
-    Args:
-        model: The Mamba3LMModel.
-
-    Returns:
-        AdamW optimizer (small param set, ~5M params total).
-    """
-    gate_params = []
     for block in model.backbone.layers:
         mx = block.mixer
-        # Only B/C biases and norms — tiny tensors, safe for 12GB
-        for attr in ("B_bias", "C_bias"):
+        d_out, d_in = mx.out_proj.weight.shape
+        mx.lora_A = nn.Parameter(torch.empty(rank, d_in, device=device, dtype=dtype))
+        mx.lora_B = nn.Parameter(torch.zeros(d_out, rank, device=device, dtype=dtype))
+        nn.init.kaiming_uniform_(mx.lora_A, a=math.sqrt(5))
+        mx.out_proj.register_forward_hook(_make_lora_hook(mx.lora_A, mx.lora_B, scale))
+
+    d_out, d_in = model.lm_head.weight.shape
+    model.lora_A = nn.Parameter(torch.empty(rank, d_in, device=device, dtype=dtype))
+    model.lora_B = nn.Parameter(torch.zeros(d_out, rank, device=device, dtype=dtype))
+    nn.init.kaiming_uniform_(model.lora_A, a=math.sqrt(5))
+    model.lm_head.register_forward_hook(_make_lora_hook(model.lora_A, model.lora_B, scale))
+
+    # Keep Phase A gate parameters trainable alongside LoRA
+    for block in model.backbone.layers:
+        mx = block.mixer
+        for attr in ("B_bias", "C_bias", "dt_bias"):
             if hasattr(mx, attr):
-                p = getattr(mx, attr)
-                p.requires_grad = True
-                gate_params.append(p)
+                getattr(mx, attr).requires_grad = True
         for attr in ("B_norm", "C_norm"):
             if hasattr(mx, attr):
                 for p in getattr(mx, attr).parameters():
                     p.requires_grad = True
-                    gate_params.append(p)
-    if not gate_params:
-        # Fallback: dt_bias (80-elem) which is safe
-        for block in model.backbone.layers:
-            block.mixer.dt_bias.requires_grad = True
-            gate_params.append(block.mixer.dt_bias)
+
+
+def build_phase_a_optimizer(model: Mamba3LMModel) -> torch.optim.AdamW:
+    gate_params = [p for p in model.parameters() if p.requires_grad]
     return torch.optim.AdamW(gate_params, lr=LR_GATES, weight_decay=0.01)
 
 
-# LoRA rank used for Phase B adapters
-LORA_RANK  = 8
-LORA_ALPHA = 16.0
-
-
-class LoRALinear(nn.Module):
-    """Lightweight LoRA adapter injected over a frozen nn.Linear.
-
-    Only trains two small matrices A [rank x d_in] and B [d_out x rank],
-    leaving the original base weights frozen. Requires fractional VRAM.
-    """
-
-    def __init__(self, base: nn.Linear, rank: int = LORA_RANK,
-                 alpha: float = LORA_ALPHA) -> None:
-        """Initialize LoRALinear.
-
-        Args:
-            base: Original frozen linear layer.
-            rank: LoRA rank.
-            alpha: LoRA alpha scaling factor.
-        """
-        super().__init__()
-        d_out, d_in = base.weight.shape
-        dtype = base.weight.dtype
-        self.bias = base.bias
-        self.scale = alpha / rank
-        self.register_buffer("base_weight", base.weight.data.clone())
-        self.lora_A = nn.Parameter(torch.empty(rank, d_in, dtype=dtype))
-        self.lora_B = nn.Parameter(torch.zeros(d_out, rank, dtype=dtype))
-        nn.init.kaiming_uniform_(self.lora_A)
-
-    @property
-    def weight(self) -> torch.Tensor:
-        """Compute effective weight with LoRA delta."""
-        return self.base_weight + self.scale * (self.lora_B @ self.lora_A)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Linear forward with LoRA."""
-        return F.linear(x, self.weight, self.bias)
-
-
-def inject_lora(model: Mamba3LMModel) -> None:
-    """Inject LoRA adapters on out_proj and lm_head for Phase B.
-
-    Keeps 99%+ of the model frozen. Only AdamW momentum for the small
-    LoRA A/B matrices is allocated — safe for 12GB VRAM.
-
-    Args:
-        model: The Mamba3LMModel.
-    """
-    # Freeze everything
-    for p in model.parameters():
-        p.requires_grad = False
-
-    # Inject LoRA on every layer's out_proj
-    for block in model.backbone.layers:
-        mx = block.mixer
-        mx.out_proj = LoRALinear(mx.out_proj).to(DEVICE)
-
-    # LoRA on lm_head too
-    model.lm_head = LoRALinear(model.lm_head).to(DEVICE)
-
-    # Also keep Phase A gate params trainable
-    for block in model.backbone.layers:
-        mx = block.mixer
-        for attr in ("B_bias", "C_bias", "dt_bias"):
-            if hasattr(mx, attr):
-                getattr(mx, attr).requires_grad = True
-
-
 def build_phase_b_optimizer(model: Mamba3LMModel) -> torch.optim.AdamW:
-    """Build Phase B optimizer: LoRA adapters + gate params.
-
-    Only trains the LoRA A/B matrices and gate params — orders of magnitude
-    fewer params than full fine-tune, safe for 12GB VRAM.
-
-    Args:
-        model: The Mamba3LMModel.
-
-    Returns:
-        AdamW optimizer covering only LoRA + gate params.
-    """
     trainable = [p for p in model.parameters() if p.requires_grad]
     return torch.optim.AdamW(trainable, lr=LR_CORE, weight_decay=0.01)
 
 
-# ─── Training step ────────────────────────────────────────────────────────────
+# ─── Training Step ────────────────────────────────────────────────────────────
 
 def train_step(
     model: Mamba3LMModel,
@@ -540,52 +281,38 @@ def train_step(
     tokenizer: object,
     step: int,
     criterion: nn.CrossEntropyLoss,
-) -> tuple:
-    """Run one training step using per-sample micro-backward to fit 12GB VRAM.
-
-    Each sample is forward+backward'd individually, freeing the activation
-    graph immediately. Gradients accumulate across the batch, then a single
-    clip+step is applied. Activation checkpointing is always enabled.
-
-    Args:
-        model: The Mamba3LMModel.
-        optimizer: Current optimizer.
-        tokenizer: HuggingFace tokenizer.
-        step: Global step index.
-        criterion: CrossEntropyLoss with ignore_index=-100.
-
-    Returns:
-        Tuple of (mean_loss, step_accuracy).
-    """
+    device: str,
+    batch_size: int = BATCH,
+) -> Tuple[float, float]:
+    """Execute one training step with per-sample micro-backward."""
     model.train()
     optimizer.zero_grad()
 
-    total_loss    = 0.0
+    total_loss = 0.0
     batch_correct = 0
-    batch_valid   = 0
+    batch_valid = 0
 
-    for b in range(BATCH):
-        prompt, answer = make_sample(step * BATCH + b)
-        input_ids, labels = build_ids(tokenizer, prompt, answer)
+    for b in range(batch_size):
+        prompt, answer = make_sample(step * batch_size + b)
+        input_ids, labels = build_ids(tokenizer, prompt, answer, device)
         if input_ids.shape[1] < 2:
             continue
 
-        with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16):
-            # Activation checkpointing always on: 64-layer backward does not
-            # fit in 12GB VRAM without it at 2.8B scale.
-            out  = model(input_ids, use_checkpoint=False)
-            sl   = out.logits[:, :-1, :].contiguous()
-            tl   = labels[:, 1:].contiguous()
+        use_autocast = device != "cpu" and torch.cuda.is_available()
+        autocast_ctx = torch.autocast(device_type=device, dtype=torch.bfloat16) if use_autocast else contextlib.nullcontext()
+
+        with autocast_ctx:
+            out = model(input_ids)
+            sl = out.logits[:, :-1, :].contiguous()
+            tl = labels[:, 1:].contiguous()
             loss = criterion(sl.view(-1, sl.size(-1)), tl.view(-1))
-            loss = loss / BATCH   # normalize for gradient accumulation parity
+            loss = loss / batch_size
 
         if torch.isnan(loss) or torch.isinf(loss):
             continue
 
-        # Per-sample backward: frees the activation graph immediately
         loss.backward()
-
-        total_loss  += loss.item() * BATCH
+        total_loss += loss.item() * batch_size
         batch_valid += 1
 
         mask_pos = (tl[0] != -100).nonzero(as_tuple=True)[0]
@@ -609,39 +336,57 @@ def train_step(
     return total_loss / batch_valid, batch_correct / batch_valid
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# ─── Main Routine ─────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """Run two-phase Mamba-3 recovery training."""
     parser = argparse.ArgumentParser(description="Mamba-3 Recovery Trainer")
+    parser.add_argument("--model_dir", type=str, default="./converted_mamba3",
+                        help="Directory containing converted Mamba-3 checkpoint")
+    parser.add_argument("--ckpt_dir", type=str, default="checkpoints/mamba3_recovery",
+                        help="Output directory for recovery checkpoints")
+    parser.add_argument("--log_path", type=str, default="mamba3_recovery.log",
+                        help="Path to training log file")
     parser.add_argument("--phase_a_steps", type=int, default=PHASE_A_STEPS)
-    parser.add_argument("--total_steps",   type=int, default=TOTAL_STEPS)
-    parser.add_argument("--resume",        type=str, default=None)
+    parser.add_argument("--total_steps", type=int, default=TOTAL_STEPS)
+    parser.add_argument("--device", type=str, default=None,
+                        help="Compute device: 'cuda', 'rocm', or 'cpu'")
+    parser.add_argument("--smoke_test", action="store_true",
+                        help="Run rapid smoke test (2 steps Phase A, 2 steps Phase B)")
+    parser.add_argument("--resume", type=str, default=None)
     args = parser.parse_args()
 
-    os.makedirs(CKPT_DIR, exist_ok=True)
+    if args.device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = args.device
+
+    if args.smoke_test:
+        args.phase_a_steps = 2
+        args.total_steps = 4
+
+    os.makedirs(args.ckpt_dir, exist_ok=True)
 
     print(f"\n{'='*68}")
     print("  MAMBA-3 RECOVERY TRAINER")
-    print(f"  Model:     {MODEL_DIR}")
-    print(f"  Phase A:   steps 0 → {args.phase_a_steps}  "
-          f"(new gates only, LR={LR_GATES})")
-    print(f"  Phase B:   steps {args.phase_a_steps} → {args.total_steps}  "
-          f"(full model, LR={LR_CORE}/{LR_HEAD})")
-    print(f"  Device:    {DEVICE.upper()}")
-    print(f"  split_idx: {SPLIT_IDX}")
+    print(f"  Model Dir: {args.model_dir}")
+    print(f"  Phase A:   steps 0 → {args.phase_a_steps} (new gates only, LR={LR_GATES})")
+    print(f"  Phase B:   steps {args.phase_a_steps} → {args.total_steps} (LoRA + gates, LR={LR_CORE})")
+    print(f"  Device:    {device.upper()}")
     print(f"{'='*68}\n")
 
     print("[INIT] Loading tokenizer…")
-    tokenizer = AutoTokenizer.from_pretrained(
-        "EleutherAI/gpt-neox-20b", use_fast=False
-    )
-    tokenizer.pad_token = tokenizer.eos_token
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_dir, use_fast=False)
+    except Exception:
+        tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b", use_fast=False)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    model = load_mamba3_model()
+    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+    model, _ = load_mamba3_model(args.model_dir, device=device, dtype=dtype, smoke_test=args.smoke_test)
 
     if args.resume and os.path.exists(args.resume):
-        sd = torch.load(args.resume, map_location=DEVICE)
+        sd = torch.load(args.resume, map_location=device)
         model.load_state_dict(sd, strict=False)
         print(f"[INIT] Resumed from {args.resume}")
 
@@ -649,8 +394,8 @@ def main() -> None:
     print(f"[INIT] Total parameters: {total_p:,}\n")
 
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
-    best_acc  = 0.0
-    rolling   = []
+    best_acc = 0.0
+    rolling = []
 
     # ══════════════════════════════════════════════════════════════════════
     # PHASE A
@@ -660,101 +405,56 @@ def main() -> None:
     print(f"{'─'*68}\n")
 
     freeze_transplanted(model)
-    optim = build_phase_a_optimizer(model)
+    optim_a = build_phase_a_optimizer(model)
     trainable_a = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Trainable: {trainable_a:,} / {total_p:,} "
-          f"({100*trainable_a/total_p:.2f}%)\n")
+    print(f"  Trainable: {trainable_a:,} / {total_p:,} ({100*trainable_a/total_p:.2f}%)\n")
 
     t0 = time.time()
-    with open(LOG_PATH, "a") as log:
-        log.write(f"\n=== MAMBA-3 RECOVERY START "
-                  f"{time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+    for step in range(args.phase_a_steps):
+        loss, acc = train_step(model, optim_a, tokenizer, step, criterion, device)
+        rolling.append(acc)
+        if len(rolling) > 100:
+            rolling.pop(0)
+        roll = sum(rolling) / len(rolling)
 
-        for step in range(args.phase_a_steps):
-            loss, acc = train_step(model, optim, tokenizer, step, criterion)
-            rolling.append(acc)
-            if len(rolling) > 100:
-                rolling.pop(0)
-            roll = sum(rolling) / len(rolling)
+        if acc > best_acc:
+            best_acc = acc
+            torch.save(model.state_dict(), f"{args.ckpt_dir}/mamba3_recovery_best.pt")
 
-            if acc > best_acc:
-                best_acc = acc
-                torch.save(model.state_dict(),
-                           f"{CKPT_DIR}/mamba3_recovery_best.pt")
-
-            if step % LOG_EVERY == 0:
-                line = (f"[A] {step:5d} | loss {loss:.4f} | "
-                        f"acc {acc:.2f} | roll {roll:.2f} | "
-                        f"best {best_acc:.2f} | {time.time()-t0:.0f}s")
-                print(line, flush=True)
-                log.write(line + "\n"); log.flush()
-
-            if step > 0 and step % CKPT_EVERY == 0:
-                p = f"{CKPT_DIR}/mamba3_recovery_a_step{step}.pt"
-                torch.save(model.state_dict(), p)
-                print(f"  [CKPT] {p}")
-
-        log.write(f"Phase A done. Best acc: {best_acc:.3f}\n")
+        if step % LOG_EVERY == 0 or args.smoke_test:
+            print(f"[A] {step:5d} | loss {loss:.4f} | acc {acc:.2f} | roll {roll:.2f} | {time.time()-t0:.1f}s", flush=True)
 
     # ══════════════════════════════════════════════════════════════════════
     # PHASE B
     # ══════════════════════════════════════════════════════════════════════
     print(f"\n{'─'*68}")
-    print("  PHASE B — full model recovery (all weights unfrozen)")
+    print("  PHASE B — full recovery (LoRA forward-hook adapters + gates)")
     print(f"{'─'*68}\n")
 
-    unfreeze_all(model)
     inject_lora(model)
-    optim = build_phase_b_optimizer(model)
+    optim_b = build_phase_b_optimizer(model)
     trainable_b = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Trainable: {trainable_b:,} / {total_p:,} "
-          f"({100*trainable_b/total_p:.2f}%)\n")
+    print(f"  Trainable: {trainable_b:,} / {total_p:,} ({100*trainable_b/total_p:.2f}%)\n")
 
-    rolling.clear()
     t0 = time.time()
+    for step in range(args.phase_a_steps, args.total_steps):
+        loss, acc = train_step(model, optim_b, tokenizer, step, criterion, device)
+        rolling.append(acc)
+        if len(rolling) > 100:
+            rolling.pop(0)
+        roll = sum(rolling) / len(rolling)
 
-    with open(LOG_PATH, "a") as log:
-        for step in range(args.phase_a_steps, args.total_steps):
-            loss, acc = train_step(model, optim, tokenizer, step, criterion)
-            rolling.append(acc)
-            if len(rolling) > 100:
-                rolling.pop(0)
-            roll = sum(rolling) / len(rolling)
+        if acc > best_acc:
+            best_acc = acc
+            torch.save(model.state_dict(), f"{args.ckpt_dir}/mamba3_recovery_best.pt")
 
-            if acc > best_acc:
-                best_acc = acc
-                torch.save(model.state_dict(),
-                           f"{CKPT_DIR}/mamba3_recovery_best.pt")
+        if step % LOG_EVERY == 0 or args.smoke_test:
+            print(f"[B] {step:5d} | loss {loss:.4f} | acc {acc:.2f} | roll {roll:.2f} | {time.time()-t0:.1f}s", flush=True)
 
-            if step % LOG_EVERY == 0:
-                line = (f"[B] {step:5d} | loss {loss:.4f} | "
-                        f"acc {acc:.2f} | roll {roll:.2f} | "
-                        f"best {best_acc:.2f} | {time.time()-t0:.0f}s")
-                print(line, flush=True)
-                log.write(line + "\n"); log.flush()
-
-            if step > 0 and step % CKPT_EVERY == 0:
-                p = f"{CKPT_DIR}/mamba3_recovery_b_step{step}.pt"
-                torch.save(model.state_dict(), p)
-                print(f"  [CKPT] {p}")
-
-            if step >= args.phase_a_steps + STOP_AFTER and roll >= STOP_ACC:
-                msg = (f"  ✅ Early stop step {step} "
-                       f"— roll {roll:.3f} >= {STOP_ACC}")
-                print(msg, flush=True)
-                log.write(msg + "\n")
-                break
-
-        final = f"{CKPT_DIR}/mamba3_recovery_final.pt"
-        torch.save(model.state_dict(), final)
-        log.write(f"Done. Best acc: {best_acc:.3f} → {final}\n")
-        log.write(f"=== END {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
-
+    final_ckpt = f"{args.ckpt_dir}/mamba3_recovery_final.pt"
+    torch.save(model.state_dict(), final_ckpt)
     print(f"\n{'='*68}")
-    print(f"  🏁 Recovery complete")
-    print(f"  Best:  {CKPT_DIR}/mamba3_recovery_best.pt")
-    print(f"  Final: {CKPT_DIR}/mamba3_recovery_final.pt")
-    print(f"  Log:   {LOG_PATH}")
+    print(f"  🏁 Recovery complete! Final checkpoint: {final_ckpt}")
     print(f"{'='*68}\n")
 
 

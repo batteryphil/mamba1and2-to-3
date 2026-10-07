@@ -120,83 +120,57 @@ def convert_mamba2_to_mamba3(
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     """Convert a Mamba-2 checkpoint to Mamba-3 SISO format.
 
-    Preserves 100% of SSD parameters:
-    - in_proj, conv1d, dt_bias, A_log, D, norm, out_proj
-    - Initializes B_bias, C_bias to 0 and B_norm, C_norm to 1.
+    Preserves 100% of SSD parameters and all non-Mamba layers for hybrid models.
+    Initializes B_bias, C_bias to 0 and B_norm, C_norm to 1.
     """
     d_model = config.get("hidden_size", config.get("d_model", 1024))
     n_layer = config.get("num_hidden_layers", config.get("n_layer", 48))
-    vocab_size = config.get("vocab_size", 50288)
     headdim = config.get("head_dim", 64)
     d_state = config.get("state_size", config.get("d_state", 128))
     ngroups = config.get("n_groups", config.get("ngroups", 1))
 
-    print(f"🏗️  Instantiating Mamba-3 shell (d_model={d_model}, n_layer={n_layer}, "
-          f"vocab_size={vocab_size}, headdim={headdim}, d_state={d_state}, ngroups={ngroups})...")
-    m3_sd = build_mamba3_shell_state_dict(
-        d_model=d_model,
-        n_layer=n_layer,
-        vocab_size=vocab_size,
-        headdim=headdim,
-        d_state=d_state,
-        ngroups=ngroups,
-        dtype=dtype,
-    )
-
-    # Global weights
+    print(f"🏗️  Initializing in-place Mamba-3 upgrade (d_model={d_model}, n_layer={n_layer}, "
+          f"headdim={headdim}, d_state={d_state}, ngroups={ngroups})...")
+          
+    # 1. Copy all original weights (preserving non-Mamba layers and structure)
+    m3_sd = {k: v.to(dtype).clone() for k, v in src_sd.items()}
+    
+    # 1b. Ensure lm_head is populated if embedding exists (for Mamba3LMModel compatibility)
     for embed_k in ("backbone.embeddings.weight", "backbone.embedding.weight", "model.embeddings.weight"):
         if embed_k in src_sd:
-            m3_sd["backbone.embedding.weight"] = src_sd[embed_k].to(dtype).clone()
-            m3_sd["lm_head.weight"] = src_sd.get("lm_head.weight", src_sd[embed_k]).to(dtype).clone()
-            break
-
-    for norm_k in ("backbone.norm_f.weight", "model.norm_f.weight", "backbone.norm.weight"):
-        if norm_k in src_sd:
-            m3_sd["backbone.norm_f.weight"] = src_sd[norm_k].to(dtype).clone()
+            if "lm_head.weight" not in m3_sd:
+                m3_sd["lm_head.weight"] = src_sd[embed_k].to(dtype).clone()
             break
 
     print("✂️  Direct SSD manifold transplant from Mamba-2 to Mamba-3...")
     for i in range(n_layer):
-        # Determine source prefix
+        # Determine if there's a Mamba layer at this index
         p_src = None
         for cand in (f"backbone.layers.{i}.", f"model.layers.{i}."):
-            if f"{cand}norm.weight" in src_sd or f"{cand}mixer.out_proj.weight" in src_sd:
+            if f"{cand}mixer.in_proj.weight" in src_sd:
                 p_src = cand
                 break
+        
         if p_src is None:
             continue
 
-        p_dst = f"backbone.layers.{i}."
-
-        # Layer pre-norm
-        if f"{p_src}norm.weight" in src_sd:
-            m3_sd[f"{p_dst}norm.weight"] = src_sd[f"{p_src}norm.weight"].to(dtype).clone()
-
-        # Mixer out_proj
-        if f"{p_src}mixer.out_proj.weight" in src_sd:
-            m3_sd[f"{p_dst}mixer.out_proj.weight"] = src_sd[f"{p_src}mixer.out_proj.weight"].to(dtype).clone()
-
-        # Mixer in_proj
-        if f"{p_src}mixer.in_proj.weight" in src_sd:
-            m3_sd[f"{p_dst}mixer.in_proj.weight"] = src_sd[f"{p_src}mixer.in_proj.weight"].to(dtype).clone()
-
-        # Mixer conv1d
-        if f"{p_src}mixer.conv1d.weight" in src_sd:
-            m3_sd[f"{p_dst}mixer.conv1d.weight"] = src_sd[f"{p_src}mixer.conv1d.weight"].to(dtype).clone()
-        if f"{p_src}mixer.conv1d.bias" in src_sd:
-            m3_sd[f"{p_dst}mixer.conv1d.bias"] = src_sd[f"{p_src}mixer.conv1d.bias"].to(dtype).clone()
-
-        # Mixer A_log, D, dt_bias
-        if f"{p_src}mixer.A_log" in src_sd:
-            m3_sd[f"{p_dst}mixer.A_log"] = src_sd[f"{p_src}mixer.A_log"].to(dtype).clone()
-        if f"{p_src}mixer.D" in src_sd:
-            m3_sd[f"{p_dst}mixer.D"] = src_sd[f"{p_src}mixer.D"].to(dtype).clone()
-        if f"{p_src}mixer.dt_bias" in src_sd:
-            m3_sd[f"{p_dst}mixer.dt_bias"] = src_sd[f"{p_src}mixer.dt_bias"].to(dtype).clone()
-
-        # Mixer internal norm
-        if f"{p_src}mixer.norm.weight" in src_sd:
-            m3_sd[f"{p_dst}mixer.norm.weight"] = src_sd[f"{p_src}mixer.norm.weight"].to(dtype).clone()
+        # Instantiate a single Mamba3 block to generate default new gating parameters
+        mixer = Mamba3(
+            d_model=d_model,
+            d_state=d_state,
+            headdim=headdim,
+            ngroups=ngroups,
+            is_mimo=False,
+            chunk_size=64,
+            layer_idx=i,
+            device="cpu",
+            dtype=dtype,
+        )
+        
+        # 2. Inject ONLY the new Mamba-3 specific gating parameters
+        for name, param in mixer.state_dict().items():
+            if name in ["B_bias", "C_bias", "B_norm.weight", "C_norm.weight"]:
+                m3_sd[f"{p_src}mixer.{name}"] = param.detach().clone()
 
     out_cfg = dict(config)
     out_cfg["model_type"] = "mamba3"

@@ -108,7 +108,7 @@ class TestMamba3Pipeline(unittest.TestCase):
 
         # Build mock Mamba-2 state dict
         m2_sd = {
-            "backbone.embeddings.weight": torch.randn(vocab_size, d_model),
+            "backbone.embedding.weight": torch.randn(vocab_size, d_model),
             "backbone.norm_f.weight": torch.ones(d_model),
         }
         for i in range(n_layer):
